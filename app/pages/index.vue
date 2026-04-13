@@ -29,6 +29,10 @@
         Edge Density: {{ edgeSampleStep }}
         <input v-model.number="edgeSampleStep" type="range" min="2" max="16" step="1" />
       </label>
+      <label class="toggle">
+        <input v-model="useMask" type="checkbox" />
+        Mask {{ maskStatus }}
+      </label>
       <span class="fps">{{ fps }} fps | {{ triCount }} tris</span>
     </div>
   </div>
@@ -37,7 +41,7 @@
 <script setup lang="ts">
 import * as THREE from 'three'
 import Delaunator from 'delaunator'
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import { FaceLandmarker, FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision'
 
 const containerEl = ref<HTMLDivElement>()
 const videoEl = ref<HTMLVideoElement>()
@@ -51,6 +55,8 @@ const faceStatus = ref('(loading...)')
 const useEdge = ref(true)
 const edgeThreshold = ref(130)
 const edgeSampleStep = ref(3)
+const useMask = ref(true)
+const maskStatus = ref('(loading...)')
 
 // --- State ---
 let renderer: THREE.WebGLRenderer
@@ -68,39 +74,45 @@ let gridPoints: number[][] = []
 
 // MediaPipe
 let faceLandmarker: FaceLandmarker | null = null
+let imageSegmenter: ImageSegmenter | null = null
 let contourIndices: number[] = []
+let cachedBinaryMask: Uint8Array | null = null
+let maskFrameCount = 0
+const MASK_UPDATE_INTERVAL = 5 // segmenter runs every N frames
 
 // Edge detection: extract points along strong luminance gradients
 // Uses Sobel-like gradient on the existing imgData (no OpenCV needed)
-let lumBuf: Float32Array // luminance buffer, allocated once
+// Optional binaryMask (same resolution as imgData) skips Sobel for background pixels
+let lumBuf: Float32Array
 function extractEdgePoints(
   imgData: Uint8ClampedArray,
   w: number,
   h: number,
   threshold: number,
   sampleStep: number,
+  binaryMask: Uint8Array | null,
 ): number[][] {
   if (!lumBuf || lumBuf.length < w * h) {
     lumBuf = new Float32Array(w * h)
   }
 
-  // Compute luminance
+  // Compute luminance (full image — Sobel kernel needs neighbors at mask edges)
   for (let i = 0; i < w * h; i++) {
     const idx = i * 4
     lumBuf[i] = imgData[idx] * 0.299 + imgData[idx + 1] * 0.587 + imgData[idx + 2] * 0.114
   }
 
-  // Sobel gradient magnitude, sample at intervals
   const pts: number[][] = []
   const t2 = threshold * threshold
   for (let y = 1; y < h - 1; y += sampleStep) {
     for (let x = 1; x < w - 1; x += sampleStep) {
-      // Sobel X
+      // Skip background pixels early (biggest perf win)
+      if (binaryMask && !binaryMask[y * w + x]) continue
+
       const gx
         = -lumBuf[(y - 1) * w + (x - 1)] + lumBuf[(y - 1) * w + (x + 1)]
         - 2 * lumBuf[y * w + (x - 1)] + 2 * lumBuf[y * w + (x + 1)]
         - lumBuf[(y + 1) * w + (x - 1)] + lumBuf[(y + 1) * w + (x + 1)]
-      // Sobel Y
       const gy
         = -lumBuf[(y - 1) * w + (x - 1)] - 2 * lumBuf[(y - 1) * w + x] - lumBuf[(y - 1) * w + (x + 1)]
         + lumBuf[(y + 1) * w + (x - 1)] + 2 * lumBuf[(y + 1) * w + x] + lumBuf[(y + 1) * w + (x + 1)]
@@ -120,11 +132,33 @@ let colArr = new Float32Array(MAX_VERTS * 3)
 // Reusable coords buffer for Delaunator
 let coordsBuf = new Float64Array(10000)
 
+async function initSegmenter(vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>) {
+  try {
+    imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      outputConfidenceMasks: true,
+    })
+    maskStatus.value = '(ready)'
+  }
+  catch (e) {
+    console.error('ImageSegmenter init failed:', e)
+    maskStatus.value = '(error)'
+  }
+}
+
 async function initFaceLandmarker() {
   try {
     const vision = await FilesetResolver.forVisionTasks(
       'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm',
     )
+    // Start segmenter init in parallel
+    initSegmenter(vision)
+
     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
       baseOptions: {
         modelAssetPath:
@@ -197,6 +231,7 @@ async function start() {
 
   // Three.js
   renderer = new THREE.WebGLRenderer({ antialias: false })
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   renderer.setSize(vw, vh)
   containerEl.value!.appendChild(renderer.domElement)
@@ -235,33 +270,87 @@ async function start() {
     offCtx.restore()
     const imgData = offCtx.getImageData(0, 0, vw, vh).data
 
-    // Collect points: grid + face landmarks + edge points
-    let allPoints: number[][] = gridPoints
+    // --- Step 1: Segmentation mask (every N frames, cached between updates) ---
+    let binaryMask: Uint8Array | null = null
+    if (useMask.value && imageSegmenter) {
+      maskFrameCount++
+      if (!cachedBinaryMask || maskFrameCount >= MASK_UPDATE_INTERVAL) {
+        maskFrameCount = 0
+        const segResult = imageSegmenter.segmentForVideo(vid, performance.now())
+        if (segResult.confidenceMasks && segResult.confidenceMasks.length > 0) {
+          const cm = segResult.confidenceMasks[0]
+          const raw = cm.getAsFloat32Array()
+          const mw = cm.width
+          const mh = cm.height
 
-    // Face landmarks
-    let facePts: number[][] = []
+          if (!cachedBinaryMask || cachedBinaryMask.length !== vw * vh) {
+            cachedBinaryMask = new Uint8Array(vw * vh)
+          }
+          for (let y = 0; y < vh; y++) {
+            const sy = Math.min(Math.floor(y / vh * mh), mh - 1)
+            for (let x = 0; x < vw; x++) {
+              const origX = vw - 1 - x
+              const sx = Math.min(Math.floor(origX / vw * mw), mw - 1)
+              cachedBinaryMask[y * vw + x] = raw[sy * mw + sx] > 0.5 ? 1 : 0
+            }
+          }
+        }
+        segResult.close()
+      }
+      binaryMask = cachedBinaryMask
+    }
+    else {
+      cachedBinaryMask = null
+    }
+
+    // --- Step 2: Collect points (all filtered by mask upfront) ---
+    let allPoints: number[][] = []
+
+    // Grid points
+    if (binaryMask) {
+      for (let i = 0; i < gridPoints.length; i++) {
+        const px = Math.floor(gridPoints[i][0])
+        const py = Math.floor(gridPoints[i][1])
+        if (px >= 0 && px < vw && py >= 0 && py < vh && binaryMask[py * vw + px]) {
+          allPoints.push(gridPoints[i])
+        }
+      }
+    }
+    else {
+      allPoints = [...gridPoints]
+    }
+
+    // Face landmarks (skip mask — always on the face)
     if (useFace.value && faceLandmarker) {
       const result = faceLandmarker.detectForVideo(vid, performance.now())
       if (result.faceLandmarks.length > 0) {
         const lm = result.faceLandmarks[0]
-        facePts = contourIndices.map((li) => {
-          return [
-            vw - lm[li].x * vw, // mirror X to match display
+        for (let i = 0; i < contourIndices.length; i++) {
+          const li = contourIndices[i]
+          allPoints.push([
+            vw - lm[li].x * vw,
             lm[li].y * vh,
-          ]
-        })
+          ])
+        }
       }
     }
 
-    // Edge detection on mirrored video pixels
-    let edgePts: number[][] = []
+    // Edge detection (mask passed in → Sobel skips background pixels)
     if (useEdge.value) {
-      edgePts = extractEdgePoints(imgData, vw, vh, edgeThreshold.value, edgeSampleStep.value)
+      const edgePts = extractEdgePoints(imgData, vw, vh, edgeThreshold.value, edgeSampleStep.value, binaryMask)
+      for (let i = 0; i < edgePts.length; i++) {
+        allPoints.push(edgePts[i])
+      }
     }
 
-    // Merge all point sources
-    if (facePts.length > 0 || edgePts.length > 0) {
-      allPoints = [...gridPoints, ...facePts, ...edgePts]
+    // Need at least 3 points for Delaunay
+    if (allPoints.length < 3) {
+      geometry.setDrawRange(0, 0)
+      renderer.render(scene, camera)
+      frames++
+      const now = performance.now()
+      if (now - lastTime >= 1000) { fps.value = frames; frames = 0; lastTime = now }
+      return
     }
 
     // Ensure coords buffer is large enough
@@ -340,6 +429,7 @@ onUnmounted(() => {
   if (renderer) renderer.dispose()
   if (geometry) geometry.dispose()
   if (faceLandmarker) faceLandmarker.close()
+  if (imageSegmenter) imageSegmenter.close()
   const vid = videoEl.value
   if (vid?.srcObject) {
     (vid.srcObject as MediaStream).getTracks().forEach(t => t.stop())
