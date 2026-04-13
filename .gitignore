@@ -1,0 +1,19 @@
+# Nuxt
+.nuxt
+.output
+dist
+
+# Node
+node_modules
+*.log
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode
+.idea
+
+# Handover
+HANDOVER-*.md
