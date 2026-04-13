@@ -2,11 +2,14 @@
 
 Webcam映像をリアルタイムにDelaunay三角形分割してローポリ化するブラウザスケッチ。
 
-2012年にopenFrameworks + Kinectで制作した[.hito project](https://github.com/rettuce/.hito-project)を、Webカメラのみ・ブラウザ完結で再構築したもの。
+2012年にopenFrameworks + Kinectで制作した[.hito project](https://github.com/rettuce/.hito-project)を、Webカメラのみ・ブラウザ完結で再構築したもの。元プロジェクトは[.hito ver.2](https://rettuce.com/work/dothito2/)として全国の美術館で展示された。
 
 **Demo**: https://rettuce.github.io/delaunay-depth-mesh/
 
-**元ネタ記事**: https://rettuce.blog/2012/12/11/kinect_of_delaunay/
+**元ネタ**:
+- [.hito ver.2](https://rettuce.com/work/dothito2/) — 展示プロジェクト
+- [.hito project](https://github.com/rettuce/.hito-project) — ソースコード (oF + Kinect)
+- [技術解説記事](https://rettuce.blog/2012/12/11/kinect_of_delaunay/) — Delaunay + 輪郭線の手法
 
 ## やっていること
 
