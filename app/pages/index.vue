@@ -7,7 +7,7 @@
     <div v-if="started" class="controls">
       <label>
         Grid: {{ gridStep }}
-        <input v-model.number="gridStep" type="range" min="6" max="40" step="1" @change="rebuildGrid" />
+        <input v-model.number="gridStep" type="range" min="6" max="60" step="1" @change="rebuildGrid" />
       </label>
       <label>
         Jitter: {{ jitter }}
@@ -22,16 +22,24 @@
         Edge
       </label>
       <label>
-        Edge Thresh: {{ edgeThreshold }}
+        ET: {{ edgeThreshold }}
         <input v-model.number="edgeThreshold" type="range" min="5" max="300" step="5" />
       </label>
       <label>
-        Edge Density: {{ edgeSampleStep }}
+        ED: {{ edgeSampleStep }}
         <input v-model.number="edgeSampleStep" type="range" min="2" max="16" step="1" />
       </label>
       <label class="toggle">
         <input v-model="useMask" type="checkbox" />
         Mask {{ maskStatus }}
+      </label>
+      <label class="toggle">
+        <input v-model="useDepth" type="checkbox" />
+        Depth {{ depthStatus }}
+      </label>
+      <label v-if="useDepth">
+        Z: {{ depthScale.toFixed(1) }}
+        <input v-model.number="depthScale" type="range" min="0" max="3" step="0.1" />
       </label>
       <span class="fps">{{ fps }} fps | {{ triCount }} tris</span>
     </div>
@@ -40,6 +48,7 @@
 
 <script setup lang="ts">
 import * as THREE from 'three'
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import Delaunator from 'delaunator'
 import { FaceLandmarker, FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision'
 
@@ -57,19 +66,24 @@ const edgeThreshold = ref(130)
 const edgeSampleStep = ref(3)
 const useMask = ref(true)
 const maskStatus = ref('(loading...)')
+const useDepth = ref(true)
+const depthStatus = ref('(loading...)')
+const depthScale = ref(1.0)
 
 // --- State ---
 let renderer: THREE.WebGLRenderer
 let scene: THREE.Scene
-let camera: THREE.OrthographicCamera
+let camera: THREE.PerspectiveCamera
+let controls: OrbitControls
 let mesh: THREE.Mesh
 let geometry: THREE.BufferGeometry
 let offCtx: CanvasRenderingContext2D
+let offCanvas: HTMLCanvasElement
 let vw = 0
 let vh = 0
 let animId: number
 
-// Static grid points (regenerated on param change)
+// Static grid points
 let gridPoints: number[][] = []
 
 // MediaPipe
@@ -78,37 +92,38 @@ let imageSegmenter: ImageSegmenter | null = null
 let contourIndices: number[] = []
 let cachedBinaryMask: Uint8Array | null = null
 let maskFrameCount = 0
-const MASK_UPDATE_INTERVAL = 5 // segmenter runs every N frames
+const MASK_UPDATE_INTERVAL = 5
 
-// Edge detection: extract points along strong luminance gradients
-// Uses Sobel-like gradient on the existing imgData (no OpenCV needed)
-// Optional binaryMask (same resolution as imgData) skips Sobel for background pixels
+// Depth estimation
+let depthPipeline: any = null
+let cachedDepthMap: Float32Array | null = null
+let depthMapW = 0
+let depthMapH = 0
+let depthRunning = false
+let depthCanvas: HTMLCanvasElement
+let depthCtx: CanvasRenderingContext2D
+const DEPTH_SCALE_FACTOR = 0.25 // 1/4 resolution for inference speed
+
+// Edge detection
 let lumBuf: Float32Array
 function extractEdgePoints(
   imgData: Uint8ClampedArray,
-  w: number,
-  h: number,
-  threshold: number,
-  sampleStep: number,
+  w: number, h: number,
+  threshold: number, sampleStep: number,
   binaryMask: Uint8Array | null,
 ): number[][] {
   if (!lumBuf || lumBuf.length < w * h) {
     lumBuf = new Float32Array(w * h)
   }
-
-  // Compute luminance (full image — Sobel kernel needs neighbors at mask edges)
   for (let i = 0; i < w * h; i++) {
     const idx = i * 4
     lumBuf[i] = imgData[idx] * 0.299 + imgData[idx + 1] * 0.587 + imgData[idx + 2] * 0.114
   }
-
   const pts: number[][] = []
   const t2 = threshold * threshold
   for (let y = 1; y < h - 1; y += sampleStep) {
     for (let x = 1; x < w - 1; x += sampleStep) {
-      // Skip background pixels early (biggest perf win)
       if (binaryMask && !binaryMask[y * w + x]) continue
-
       const gx
         = -lumBuf[(y - 1) * w + (x - 1)] + lumBuf[(y - 1) * w + (x + 1)]
         - 2 * lumBuf[y * w + (x - 1)] + 2 * lumBuf[y * w + (x + 1)]
@@ -116,7 +131,6 @@ function extractEdgePoints(
       const gy
         = -lumBuf[(y - 1) * w + (x - 1)] - 2 * lumBuf[(y - 1) * w + x] - lumBuf[(y - 1) * w + (x + 1)]
         + lumBuf[(y + 1) * w + (x - 1)] + 2 * lumBuf[(y + 1) * w + x] + lumBuf[(y + 1) * w + (x + 1)]
-
       if (gx * gx + gy * gy > t2) {
         pts.push([x, y])
       }
@@ -125,14 +139,23 @@ function extractEdgePoints(
   return pts
 }
 
-// Pre-allocated buffers (max ~10000 triangles)
+// Sample depth at a point (mirrored display coords)
+function sampleDepth(x: number, y: number): number {
+  if (!cachedDepthMap) return 0
+  const dx = Math.min(Math.max(Math.floor(x / vw * depthMapW), 0), depthMapW - 1)
+  const dy = Math.min(Math.max(Math.floor(y / vh * depthMapH), 0), depthMapH - 1)
+  return cachedDepthMap[dy * depthMapW + dx]
+}
+
+// Pre-allocated buffers
 const MAX_VERTS = 30000
 let posArr = new Float32Array(MAX_VERTS * 3)
 let colArr = new Float32Array(MAX_VERTS * 3)
-// Reusable coords buffer for Delaunator
 let coordsBuf = new Float64Array(10000)
 
-async function initSegmenter(vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>) {
+// --- Init functions ---
+
+async function initSegmenter(vision: any) {
   try {
     imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
       baseOptions: {
@@ -156,7 +179,6 @@ async function initFaceLandmarker() {
     const vision = await FilesetResolver.forVisionTasks(
       'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm',
     )
-    // Start segmenter init in parallel
     initSegmenter(vision)
 
     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -168,8 +190,6 @@ async function initFaceLandmarker() {
       runningMode: 'VIDEO',
       numFaces: 1,
     })
-
-    // Extract unique point indices from contour connections
     const indexSet = new Set<number>()
     for (const conn of FaceLandmarker.FACE_LANDMARKS_CONTOURS) {
       indexSet.add(conn.start)
@@ -184,18 +204,70 @@ async function initFaceLandmarker() {
   }
 }
 
+async function initDepthEstimator() {
+  try {
+    depthStatus.value = '(downloading...)'
+    const { pipeline: createPipeline } = await import('@huggingface/transformers')
+    depthPipeline = await createPipeline(
+      'depth-estimation',
+      'onnx-community/depth-anything-v2-small',
+      {
+        device: 'webgpu',
+        dtype: 'fp32',
+      },
+    )
+    depthStatus.value = '(ready)'
+  }
+  catch (e) {
+    console.error('Depth estimator init failed:', e)
+    // Fallback to CPU/wasm
+    try {
+      depthStatus.value = '(fallback wasm...)'
+      const { pipeline: createPipeline } = await import('@huggingface/transformers')
+      depthPipeline = await createPipeline(
+        'depth-estimation',
+        'onnx-community/depth-anything-v2-small',
+      )
+      depthStatus.value = '(wasm)'
+    }
+    catch (e2) {
+      console.error('Depth estimator fallback failed:', e2)
+      depthStatus.value = '(error)'
+    }
+  }
+}
+
+// Non-blocking depth update (runs on downscaled canvas for speed)
+async function updateDepthMap() {
+  if (depthRunning || !depthPipeline || !depthCanvas) return
+  depthRunning = true
+  try {
+    // Draw current mirrored video to small canvas
+    depthCtx.drawImage(offCanvas, 0, 0, depthCanvas.width, depthCanvas.height)
+    const result = await depthPipeline(depthCanvas)
+    if (result?.depth) {
+      const d = result.depth
+      cachedDepthMap = d.data as Float32Array
+      depthMapW = d.width
+      depthMapH = d.height
+    }
+  }
+  catch (e) {
+    console.error('Depth estimation error:', e)
+  }
+  finally {
+    depthRunning = false
+  }
+}
+
 function generateGridPoints(w: number, h: number, step: number, jit: number): number[][] {
   const pts: number[][] = []
-
-  // Border
   for (let x = 0; x <= w; x += step) {
     pts.push([x, 0], [x, h])
   }
   for (let y = step; y < h; y += step) {
     pts.push([0, y], [w, y])
   }
-
-  // Interior with jitter
   for (let y = step; y < h; y += step) {
     for (let x = step; x < w; x += step) {
       pts.push([
@@ -223,42 +295,69 @@ async function start() {
   vw = vid.videoWidth
   vh = vid.videoHeight
 
-  // Offscreen canvas for pixel sampling
-  const offCanvas = document.createElement('canvas')
+  // Offscreen canvas for pixel sampling (mirrored)
+  offCanvas = document.createElement('canvas')
   offCanvas.width = vw
   offCanvas.height = vh
   offCtx = offCanvas.getContext('2d', { willReadFrequently: true })!
 
-  // Three.js
+  // Small canvas for depth inference (1/4 res = ~16x faster)
+  depthCanvas = document.createElement('canvas')
+  depthCanvas.width = Math.round(vw * DEPTH_SCALE_FACTOR)
+  depthCanvas.height = Math.round(vh * DEPTH_SCALE_FACTOR)
+  depthCtx = depthCanvas.getContext('2d')!
+
+  // Three.js — PerspectiveCamera for 3D depth view
   renderer = new THREE.WebGLRenderer({ antialias: false })
   renderer.outputColorSpace = THREE.LinearSRGBColorSpace
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-  renderer.setSize(vw, vh)
+  renderer.setSize(window.innerWidth, window.innerHeight)
   containerEl.value!.appendChild(renderer.domElement)
 
   scene = new THREE.Scene()
   scene.background = new THREE.Color(0x000000)
-  camera = new THREE.OrthographicCamera(0, vw, 0, vh, -1, 1)
-  camera.position.z = 1
 
-  // Pre-allocate geometry with max capacity
+  const fov = 50
+  const aspect = window.innerWidth / window.innerHeight
+  camera = new THREE.PerspectiveCamera(fov, aspect, 1, 5000)
+  // Position camera centered on the mesh, pulled back
+  const camDist = (vh / 2) / Math.tan((fov / 2) * Math.PI / 180)
+  camera.position.set(vw / 2, vh / 2, camDist)
+
+  controls = new OrbitControls(camera, renderer.domElement)
+  controls.target.set(vw / 2, vh / 2, 0)
+  controls.enableDamping = true
+  controls.dampingFactor = 0.1
+  controls.update()
+
+  // Pre-allocate geometry
   geometry = new THREE.BufferGeometry()
   geometry.setAttribute('position', new THREE.BufferAttribute(posArr, 3))
   geometry.setAttribute('color', new THREE.BufferAttribute(colArr, 3))
   geometry.setDrawRange(0, 0)
 
-  const material = new THREE.MeshBasicMaterial({ vertexColors: true })
+  const material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
   mesh = new THREE.Mesh(geometry, material)
   scene.add(mesh)
 
-  // Generate initial grid
   gridPoints = generateGridPoints(vw, vh, gridStep.value, jitter.value)
 
-  // Start loading MediaPipe (async, non-blocking)
+  // Start loading models (async, non-blocking)
   initFaceLandmarker()
+  initDepthEstimator()
+
+  // Handle resize
+  const onResize = () => {
+    camera.aspect = window.innerWidth / window.innerHeight
+    camera.updateProjectionMatrix()
+    renderer.setSize(window.innerWidth, window.innerHeight)
+  }
+  window.addEventListener('resize', onResize)
 
   let lastTime = performance.now()
   let frames = 0
+  let depthFrameCount = 0
+  const DEPTH_UPDATE_INTERVAL = 1
 
   function animate() {
     animId = requestAnimationFrame(animate)
@@ -270,7 +369,7 @@ async function start() {
     offCtx.restore()
     const imgData = offCtx.getImageData(0, 0, vw, vh).data
 
-    // --- Step 1: Segmentation mask (every N frames, cached between updates) ---
+    // --- Segmentation mask (every N frames) ---
     let binaryMask: Uint8Array | null = null
     if (useMask.value && imageSegmenter) {
       maskFrameCount++
@@ -282,7 +381,6 @@ async function start() {
           const raw = cm.getAsFloat32Array()
           const mw = cm.width
           const mh = cm.height
-
           if (!cachedBinaryMask || cachedBinaryMask.length !== vw * vh) {
             cachedBinaryMask = new Uint8Array(vw * vh)
           }
@@ -303,10 +401,18 @@ async function start() {
       cachedBinaryMask = null
     }
 
-    // --- Step 2: Collect points (all filtered by mask upfront) ---
+    // --- Depth estimation (non-blocking, every N frames) ---
+    if (useDepth.value && depthPipeline) {
+      depthFrameCount++
+      if (depthFrameCount >= DEPTH_UPDATE_INTERVAL) {
+        depthFrameCount = 0
+        updateDepthMap()
+      }
+    }
+
+    // --- Collect points ---
     let allPoints: number[][] = []
 
-    // Grid points
     if (binaryMask) {
       for (let i = 0; i < gridPoints.length; i++) {
         const px = Math.floor(gridPoints[i][0])
@@ -320,7 +426,6 @@ async function start() {
       allPoints = [...gridPoints]
     }
 
-    // Face landmarks (skip mask — always on the face)
     if (useFace.value && faceLandmarker) {
       const result = faceLandmarker.detectForVideo(vid, performance.now())
       if (result.faceLandmarks.length > 0) {
@@ -335,7 +440,6 @@ async function start() {
       }
     }
 
-    // Edge detection (mask passed in → Sobel skips background pixels)
     if (useEdge.value) {
       const edgePts = extractEdgePoints(imgData, vw, vh, edgeThreshold.value, edgeSampleStep.value, binaryMask)
       for (let i = 0; i < edgePts.length; i++) {
@@ -343,9 +447,9 @@ async function start() {
       }
     }
 
-    // Need at least 3 points for Delaunay
     if (allPoints.length < 3) {
       geometry.setDrawRange(0, 0)
+      controls.update()
       renderer.render(scene, camera)
       frames++
       const now = performance.now()
@@ -353,7 +457,7 @@ async function start() {
       return
     }
 
-    // Ensure coords buffer is large enough
+    // --- Delaunay ---
     const totalPts = allPoints.length
     if (coordsBuf.length < totalPts * 2) {
       coordsBuf = new Float64Array(totalPts * 4)
@@ -362,13 +466,10 @@ async function start() {
       coordsBuf[i * 2] = allPoints[i][0]
       coordsBuf[i * 2 + 1] = allPoints[i][1]
     }
-
-    // Delaunay triangulation
     const del = new Delaunator(coordsBuf.subarray(0, totalPts * 2))
     const numTri = del.triangles.length / 3
     triCount.value = numTri
 
-    // Ensure vertex buffers are large enough
     const neededVerts = numTri * 3
     if (posArr.length < neededVerts * 3) {
       posArr = new Float32Array(neededVerts * 4)
@@ -377,7 +478,8 @@ async function start() {
       geometry.setAttribute('color', new THREE.BufferAttribute(colArr, 3))
     }
 
-    // Build positions + sample colors
+    // --- Build mesh with depth Z ---
+    const dScale = useDepth.value ? depthScale.value : 0
     for (let t = 0; t < numTri; t++) {
       const i0 = del.triangles[t * 3]
       const i1 = del.triangles[t * 3 + 1]
@@ -387,11 +489,16 @@ async function start() {
       const x2 = allPoints[i2][0], y2 = allPoints[i2][1]
 
       const b = t * 9
-      posArr[b] = x0; posArr[b + 1] = y0; posArr[b + 2] = 0
-      posArr[b + 3] = x1; posArr[b + 4] = y1; posArr[b + 5] = 0
-      posArr[b + 6] = x2; posArr[b + 7] = y2; posArr[b + 8] = 0
+      posArr[b] = x0
+      posArr[b + 1] = vh - y0
+      posArr[b + 2] = sampleDepth(x0, y0) * dScale
+      posArr[b + 3] = x1
+      posArr[b + 4] = vh - y1
+      posArr[b + 5] = sampleDepth(x1, y1) * dScale
+      posArr[b + 6] = x2
+      posArr[b + 7] = vh - y2
+      posArr[b + 8] = sampleDepth(x2, y2) * dScale
 
-      // Centroid color from mirrored video
       const cx = (x0 + x1 + x2) / 3
       const cy = (y0 + y1 + y2) / 3
       const px = Math.min(Math.max(Math.floor(cx), 0), vw - 1)
@@ -409,9 +516,10 @@ async function start() {
     geometry.setDrawRange(0, numTri * 3)
     geometry.getAttribute('position').needsUpdate = true
     geometry.getAttribute('color').needsUpdate = true
+
+    controls.update()
     renderer.render(scene, camera)
 
-    // FPS counter
     frames++
     const now = performance.now()
     if (now - lastTime >= 1000) {
@@ -426,6 +534,7 @@ async function start() {
 
 onUnmounted(() => {
   if (animId) cancelAnimationFrame(animId)
+  if (controls) controls.dispose()
   if (renderer) renderer.dispose()
   if (geometry) geometry.dispose()
   if (faceLandmarker) faceLandmarker.close()
@@ -450,9 +559,6 @@ html, body, #__nuxt {
 .container {
   width: 100vw;
   height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   position: relative;
 }
 
@@ -461,9 +567,9 @@ html, body, #__nuxt {
 }
 
 .container canvas {
-  max-width: 100vw;
-  max-height: 100vh;
-  object-fit: contain;
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .overlay {
@@ -495,22 +601,25 @@ html, body, #__nuxt {
   bottom: 16px;
   left: 16px;
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 12px 16px;
   align-items: center;
   z-index: 10;
   font-family: monospace;
-  font-size: 12px;
+  font-size: 11px;
   color: rgba(255, 255, 255, 0.6);
+  max-width: calc(100vw - 32px);
 }
 
 .controls label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  white-space: nowrap;
 }
 
 .controls input[type="range"] {
-  width: 100px;
+  width: 80px;
   accent-color: #fff;
 }
 
